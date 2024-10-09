@@ -1,0 +1,6 @@
+requests==2.26.0
+loguru
+capmonster-python
+colorama==0.4.4
+tqdm
+rich
