@@ -13,7 +13,7 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
 
 # Configuration
 FAUCET_URL = "https://faucet.testnet-1.testnet.allora.network"
-CAPMONSTER_API_KEY = "YOUT_API"
+CAPMONSTER_API_KEY = "YOUR_API"
 RECAPTCHA_SITE_KEY = "6LeWDBYqAAAAAIcTRXi4JLbAlu7mxlIdpHEZilyo"
 CAPTCHA_TIMEOUT = 120
 MAX_PROCESSES = min(cpu_count(), 5)  # Use no more than 5 processes or CPU core count
@@ -92,6 +92,11 @@ def send_faucet_request(address_proxy):
         }
         logger.debug(f"{address} | Sending faucet request")
         response = session.post(f"{FAUCET_URL}/send", json=payload, headers=headers)
+        
+        if response.status_code == 429:
+            logger.info(f"RATE LIMITED {address}: Too many requests")
+            return "ALREADY_RECEIVED", address
+        
         response.raise_for_status()
         result = response.json()
         logger.debug(f"{address} | Faucet response: {result}")
@@ -107,12 +112,8 @@ def send_faucet_request(address_proxy):
             return "ERROR", address
 
     except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 429:
-            logger.info(f"RATE LIMITED {address}: Too many requests")
-            return "RATE_LIMITED", address
-        else:
-            logger.error(f"HTTP ERROR {address}: {str(e)}")
-            return "ERROR", address
+        logger.error(f"HTTP ERROR {address}: {str(e)}")
+        return "ERROR", address
     except Exception as e:
         logger.error(f"ERROR {address}: {str(e)}")
         return "ERROR", address
@@ -126,9 +127,6 @@ def process_address(args):
         if status in ["SUCCESS", "ALREADY_RECEIVED"]:
             progress_queue.put(1)
             return status, address
-        elif status == "RATE_LIMITED":
-            logger.info(f"{address} | Rate limited, waiting for 60 seconds")
-            time.sleep(60)  # Wait for a minute before retrying
         else:
             logger.info(f"{address} | Error occurred, retrying in 5 seconds")
             time.sleep(5)
