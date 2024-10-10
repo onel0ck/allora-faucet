@@ -13,16 +13,18 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
 
 # Configuration
 FAUCET_URL = "https://faucet.testnet-1.testnet.allora.network"
-CAPMONSTER_API_KEY = "YOUR_API"
+CAPMONSTER_API_KEY = "YOUT_API"
 RECAPTCHA_SITE_KEY = "6LeWDBYqAAAAAIcTRXi4JLbAlu7mxlIdpHEZilyo"
 CAPTCHA_TIMEOUT = 120
 MAX_PROCESSES = min(cpu_count(), 5)  # Use no more than 5 processes or CPU core count
 RESULTS_DIR = "results"
+MAX_RETRIES = 3
+RETRY_DELAY = 5
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 logger.remove()
-logger.add(os.path.join(RESULTS_DIR, "log.txt"), format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}", level="INFO")
+logger.add(os.path.join(RESULTS_DIR, "log.txt"), format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}", level="DEBUG")
 
 console = Console()
 
@@ -30,18 +32,36 @@ def load_file(filename):
     with open(filename, 'r') as file:
         return [line.strip() for line in file]
 
-def solve_recaptcha(url):
+def solve_recaptcha(url, address):
     capmonster = RecaptchaV2Task(CAPMONSTER_API_KEY)
-    task_id = capmonster.create_task(url, RECAPTCHA_SITE_KEY)
     
-    start_time = time.time()
-    while time.time() - start_time < CAPTCHA_TIMEOUT:
-        result = capmonster.join_task_result(task_id, maximum_time=5)
-        if result.get("gRecaptchaResponse"):
-            return result.get("gRecaptchaResponse")
-        time.sleep(5)
-    
-    raise Exception("Failed to solve reCAPTCHA within the time limit")
+    for attempt in range(MAX_RETRIES):
+        try:
+            logger.debug(f"{address} | Captcha attempt {attempt + 1}")
+            task_id = capmonster.create_task(url, RECAPTCHA_SITE_KEY)
+            logger.debug(f"{address} | Captcha task created: {task_id}")
+            
+            start_time = time.time()
+            while time.time() - start_time < CAPTCHA_TIMEOUT:
+                result = capmonster.join_task_result(task_id, maximum_time=10)
+                if result.get("gRecaptchaResponse"):
+                    logger.debug(f"{address} | Captcha solved successfully")
+                    return result.get("gRecaptchaResponse")
+                logger.debug(f"{address} | Waiting for captcha solution...")
+                time.sleep(2)
+            
+            # If we reach here, it means we've timed out
+            raise Exception("Captcha solving timed out")
+        
+        except Exception as e:
+            logger.warning(f"{address} | Captcha solving attempt {attempt + 1} failed: {str(e)}")
+            if attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAY * (2 ** attempt) + random.uniform(0, 1)
+                logger.info(f"{address} | Retrying captcha in {delay:.2f} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"{address} | All captcha solving attempts failed")
+                raise
 
 def send_faucet_request(address_proxy):
     address, proxy = address_proxy
@@ -55,50 +75,71 @@ def send_faucet_request(address_proxy):
     session.proxies = {"http": proxy, "https": proxy}
 
     try:
-        logger.info(f"{address} START")
+        logger.info(f"{address} | START")
         
         response = session.get(f"{FAUCET_URL}/config.json", headers=headers)
         response.raise_for_status()
+        logger.debug(f"{address} | Config fetched successfully")
 
-        logger.info(f"{address} START CAPTCHA")
-        recaptcha_token = solve_recaptcha(FAUCET_URL)
-        logger.info(f"{address} CAPTCHA SOLVED")
+        logger.info(f"{address} | START CAPTCHA")
+        recaptcha_token = solve_recaptcha(FAUCET_URL, address)
+        logger.info(f"{address} | CAPTCHA SOLVED")
 
         payload = {
             "chain": "allora-testnet-1",
             "address": address,
             "recapcha_token": recaptcha_token
         }
+        logger.debug(f"{address} | Sending faucet request")
         response = session.post(f"{FAUCET_URL}/send", json=payload, headers=headers)
         response.raise_for_status()
         result = response.json()
+        logger.debug(f"{address} | Faucet response: {result}")
         
-        if result.get("code") == 0 or (result.get("code") == 1 and "Too many faucet requests" in result.get("message", "")):
-            logger.info(f"SUCCESS {address}")
-            return True, address
+        if result.get("code") == 0:
+            logger.info(f"SUCCESS {address}: {result.get('message')}")
+            return "SUCCESS", address
+        elif result.get("code") == 1 and "Too many faucet requests" in result.get("message", ""):
+            logger.info(f"ALREADY RECEIVED {address}: {result.get('message')}")
+            return "ALREADY_RECEIVED", address
         else:
             logger.error(f"ERROR {address}: {result.get('message')}")
-            return False, address
+            return "ERROR", address
 
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 429:
+            logger.info(f"RATE LIMITED {address}: Too many requests")
+            return "RATE_LIMITED", address
+        else:
+            logger.error(f"HTTP ERROR {address}: {str(e)}")
+            return "ERROR", address
     except Exception as e:
         logger.error(f"ERROR {address}: {str(e)}")
-        return False, address
+        return "ERROR", address
 
 def process_address(args):
     address_proxy, progress_queue = args
     max_retries = 3
     for attempt in range(max_retries):
-        success, address = send_faucet_request(address_proxy)
-        if success:
+        logger.debug(f"{address_proxy[0]} | Processing attempt {attempt + 1}")
+        status, address = send_faucet_request(address_proxy)
+        if status in ["SUCCESS", "ALREADY_RECEIVED"]:
             progress_queue.put(1)
-            return success, address
-        time.sleep(5)
+            return status, address
+        elif status == "RATE_LIMITED":
+            logger.info(f"{address} | Rate limited, waiting for 60 seconds")
+            time.sleep(60)  # Wait for a minute before retrying
+        else:
+            logger.info(f"{address} | Error occurred, retrying in 5 seconds")
+            time.sleep(5)
     progress_queue.put(1)
-    return False, address_proxy[0]
+    return status, address_proxy[0]
 
 def main():
     proxies = load_file("proxies.txt")
     addresses = load_file("addresses.txt")
+
+    logger.info(f"Loaded {len(addresses)} addresses and {len(proxies)} proxies")
 
     address_proxy_pairs = list(zip(addresses, proxies))
 
@@ -128,16 +169,24 @@ def main():
                     time.sleep(0.1)
                 results = async_results.get()
 
+    logger.info("Processing completed. Writing results to files.")
+
     console.print("\nResults:")
     with open(os.path.join(RESULTS_DIR, "SUCCESS.txt"), "w") as success_file, \
+         open(os.path.join(RESULTS_DIR, "ALREADY_RECEIVED.txt"), "w") as already_received_file, \
          open(os.path.join(RESULTS_DIR, "FAIL.txt"), "w") as fail_file:
-        for success, address in results:
-            if success:
+        for status, address in results:
+            if status == "SUCCESS":
                 console.print(f"[green]SUCCESS:[/green] {address}")
                 success_file.write(f"{address}\n")
+            elif status == "ALREADY_RECEIVED":
+                console.print(f"[yellow]ALREADY RECEIVED:[/yellow] {address}")
+                already_received_file.write(f"{address}\n")
             else:
                 console.print(f"[red]ERROR:[/red] {address}")
                 fail_file.write(f"{address}\n")
+
+    logger.info("Results have been written to files in the results directory.")
 
 if __name__ == "__main__":
     main()
