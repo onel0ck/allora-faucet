@@ -12,11 +12,14 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
 
 # Configuration
-FAUCET_URL = "https://faucet.testnet-1.testnet.allora.network"
-CAPMONSTER_API_KEY = "YOUR_API"
+FAUCET_URLS = {
+    "main": "https://faucet.testnet-1.testnet.allora.network",
+    "secondary": "https://allora-faucet-api.iamscray.dev"
+}
+CAPMONSTER_API_KEY = "287d0febef238cf1fc3370732dc468b3"
 RECAPTCHA_SITE_KEY = "6LeWDBYqAAAAAIcTRXi4JLbAlu7mxlIdpHEZilyo"
 CAPTCHA_TIMEOUT = 120
-MAX_PROCESSES = min(cpu_count(), 5)  # Use no more than 5 processes or CPU core count
+MAX_PROCESSES = min(cpu_count(), 10)
 RESULTS_DIR = "results"
 MAX_RETRIES = 3
 RETRY_DELAY = 5
@@ -50,7 +53,6 @@ def solve_recaptcha(url, address):
                 logger.debug(f"{address} | Waiting for captcha solution...")
                 time.sleep(2)
             
-            # If we reach here, it means we've timed out
             raise Exception("Captcha solving timed out")
         
         except Exception as e:
@@ -63,67 +65,85 @@ def solve_recaptcha(url, address):
                 logger.error(f"{address} | All captcha solving attempts failed")
                 raise
 
-def send_faucet_request(address_proxy):
-    address, proxy = address_proxy
+def send_secondary_faucet_request(session, address, headers):
+    payload = {"address": address}
+    response = session.post(f"{FAUCET_URLS['secondary']}/claim", json=payload, headers=headers)
+    response.raise_for_status()
+    result = response.json()
+    
+    if result.get("code") == 0:
+        return "SUCCESS", result.get("message")
+    elif result.get("code") == 1:
+        return "ALREADY_RECEIVED", result.get("message")
+    return "ERROR", result.get("message")
+
+def send_main_faucet_request(session, address, recaptcha_token, headers):
+    payload = {
+        "chain": "allora-testnet-1",
+        "address": address,
+        "recapcha_token": recaptcha_token
+    }
+    response = session.post(f"{FAUCET_URLS['main']}/send", json=payload, headers=headers)
+    
+    if response.status_code == 429:
+        return "ALREADY_RECEIVED", "Too many requests"
+    
+    response.raise_for_status()
+    result = response.json()
+    
+    if result.get("code") == 0:
+        return "SUCCESS", result.get("message")
+    elif result.get("code") == 1 and "Too many faucet requests" in result.get("message", ""):
+        return "ALREADY_RECEIVED", result.get("message")
+    return "ERROR", result.get("message")
+
+def send_faucet_request(address_proxy_faucet):
+    address, proxy, use_secondary = address_proxy_faucet
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0"
     ]
-    headers = {"User-Agent": random.choice(user_agents)}
+    headers = {
+        "User-Agent": random.choice(user_agents),
+        "Accept": "*/*",
+        "Content-Type": "application/json",
+        "Origin": "https://allora-faucet.iamscray.dev",
+        "Referer": "https://allora-faucet.iamscray.dev/"
+    }
+    
     session = requests.Session()
     session.proxies = {"http": proxy, "https": proxy}
 
     try:
-        logger.info(f"{address} | START")
+        logger.info(f"{address} | START | Using {'secondary' if use_secondary else 'main'} faucet")
         
-        response = session.get(f"{FAUCET_URL}/config.json", headers=headers)
-        response.raise_for_status()
-        logger.debug(f"{address} | Config fetched successfully")
-
-        logger.info(f"{address} | START CAPTCHA")
-        recaptcha_token = solve_recaptcha(FAUCET_URL, address)
-        logger.info(f"{address} | CAPTCHA SOLVED")
-
-        payload = {
-            "chain": "allora-testnet-1",
-            "address": address,
-            "recapcha_token": recaptcha_token
-        }
-        logger.debug(f"{address} | Sending faucet request")
-        response = session.post(f"{FAUCET_URL}/send", json=payload, headers=headers)
-        
-        if response.status_code == 429:
-            logger.info(f"RATE LIMITED {address}: Too many requests")
-            return "ALREADY_RECEIVED", address
-        
-        response.raise_for_status()
-        result = response.json()
-        logger.debug(f"{address} | Faucet response: {result}")
-        
-        if result.get("code") == 0:
-            logger.info(f"SUCCESS {address}: {result.get('message')}")
-            return "SUCCESS", address
-        elif result.get("code") == 1 and "Too many faucet requests" in result.get("message", ""):
-            logger.info(f"ALREADY RECEIVED {address}: {result.get('message')}")
-            return "ALREADY_RECEIVED", address
+        if use_secondary:
+            status, message = send_secondary_faucet_request(session, address, headers)
         else:
-            logger.error(f"ERROR {address}: {result.get('message')}")
-            return "ERROR", address
+            response = session.get(f"{FAUCET_URLS['main']}/config.json", headers=headers)
+            response.raise_for_status()
+            logger.debug(f"{address} | Config fetched successfully")
+            
+            logger.info(f"{address} | START CAPTCHA")
+            recaptcha_token = solve_recaptcha(FAUCET_URLS['main'], address)
+            logger.info(f"{address} | CAPTCHA SOLVED")
+            
+            status, message = send_main_faucet_request(session, address, recaptcha_token, headers)
+        
+        logger.info(f"{status} {address}: {message}")
+        return status, address
 
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP ERROR {address}: {str(e)}")
-        return "ERROR", address
     except Exception as e:
         logger.error(f"ERROR {address}: {str(e)}")
         return "ERROR", address
 
 def process_address(args):
-    address_proxy, progress_queue = args
+    address_proxy_faucet, progress_queue = args
     max_retries = 3
     for attempt in range(max_retries):
-        logger.debug(f"{address_proxy[0]} | Processing attempt {attempt + 1}")
-        status, address = send_faucet_request(address_proxy)
+        logger.debug(f"{address_proxy_faucet[0]} | Processing attempt {attempt + 1}")
+        status, address = send_faucet_request(address_proxy_faucet)
         if status in ["SUCCESS", "ALREADY_RECEIVED"]:
             progress_queue.put(1)
             return status, address
@@ -131,15 +151,16 @@ def process_address(args):
             logger.info(f"{address} | Error occurred, retrying in 5 seconds")
             time.sleep(5)
     progress_queue.put(1)
-    return status, address_proxy[0]
+    return status, address_proxy_faucet[0]
 
-def main():
+def main(use_secondary=False):
     proxies = load_file("proxies.txt")
     addresses = load_file("addresses.txt")
 
     logger.info(f"Loaded {len(addresses)} addresses and {len(proxies)} proxies")
+    logger.info(f"Using {'secondary' if use_secondary else 'main'} faucet")
 
-    address_proxy_pairs = list(zip(addresses, proxies))
+    address_proxy_pairs = [(addr, proxy, use_secondary) for addr, proxy in zip(addresses, proxies)]
 
     progress = Progress(
         SpinnerColumn(),
@@ -187,4 +208,8 @@ def main():
     logger.info("Results have been written to files in the results directory.")
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--secondary", action="store_true", help="Use secondary faucet")
+    args = parser.parse_args()
+    main(use_secondary=args.secondary)
